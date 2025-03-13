@@ -34,9 +34,6 @@ esp_err_t _esp_modem_set_operator(esp_modem_dce_t *dce_wrap, int mode, int forma
 esp_err_t _esp_modem_set_network_bands(esp_modem_dce_t *dce_wrap, const char *mode, const int *bands, int size);
 };
 
-static PPPClass *_esp_modem = NULL;
-static esp_event_handler_instance_t _ppp_ev_instance = NULL;
-
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_VERBOSE
 static const char *_ppp_event_name(int32_t event_id) {
   switch (event_id) {
@@ -85,27 +82,13 @@ static const char *_ppp_terminal_error_name(esp_modem_terminal_error_t err) {
 }
 #endif
 
-static void _ppp_event_cb(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
-  if (event_base == NETIF_PPP_STATUS) {
-    if (_esp_modem != NULL) {
-      _esp_modem->_onPppEvent(event_id, event_data);
-    }
-  }
-}
-
-static void onPppArduinoEvent(arduino_event_id_t event, arduino_event_info_t info) {
-  if (event >= ARDUINO_EVENT_PPP_START && event <= ARDUINO_EVENT_PPP_GOT_IP6) {
-    _esp_modem->_onPppArduinoEvent(event, info);
-  }
-}
-
 // PPP Error Callback
 static void _ppp_error_cb(esp_modem_terminal_error_t err) {
   log_v("PPP Driver Error %ld: %s", err, _ppp_terminal_error_name(err));
 }
 
 // PPP Arduino Events Callback
-void PPPClass::_onPppArduinoEvent(arduino_event_id_t event, arduino_event_info_t info) {
+void PPPClass::_onPppArduinoEvent(arduino_event_id_t event, const arduino_event_info_t *info) {
   log_v("PPP Arduino Event %ld: %s", event, Network.eventName(event));
   // if(event == ARDUINO_EVENT_PPP_GOT_IP){
   //     if((getStatusBits() & ESP_NETIF_CONNECTED_BIT) == 0){
@@ -115,13 +98,12 @@ void PPPClass::_onPppArduinoEvent(arduino_event_id_t event, arduino_event_info_t
   //         Network.postEvent(&arduino_event);
   //     }
   // } else
-  if (event == ARDUINO_EVENT_PPP_LOST_IP) {
-    if ((getStatusBits() & ESP_NETIF_CONNECTED_BIT) != 0) {
+  switch (event){
+    case ARDUINO_EVENT_PPP_LOST_IP :
       clearStatusBits(ESP_NETIF_CONNECTED_BIT);
-      arduino_event_t arduino_event;
-      arduino_event.event_id = ARDUINO_EVENT_PPP_DISCONNECTED;
-      Network.postEvent(&arduino_event);
-    }
+      Network.postEvent(ARDUINO_EVENT_PPP_DISCONNECTED);
+      break;
+    default:;
   }
 }
 
@@ -154,7 +136,7 @@ PPPClass::PPPClass()
   : _dce(NULL), _pin_tx(-1), _pin_rx(-1), _pin_rts(-1), _pin_cts(-1), _flow_ctrl(ESP_MODEM_FLOW_CONTROL_NONE), _pin_rst(-1), _pin_rst_act_low(true),
     _pin_rst_delay(200), _pin(NULL), _apn(NULL), _rx_buffer_size(4096), _tx_buffer_size(512), _mode(ESP_MODEM_MODE_COMMAND), _uart_num(UART_NUM_1) {}
 
-PPPClass::~PPPClass() {}
+PPPClass::~PPPClass() { end(); }
 
 bool PPPClass::pppDetachBus(void *bus_pointer) {
   PPPClass *bus = (PPPClass *)bus_pointer;
@@ -250,12 +232,16 @@ bool PPPClass::begin(ppp_modem_model_t model, uint8_t uart_num, int baud_rate) {
   }
 
   _uart_num = uart_num;
-  _esp_modem = this;
 
   Network.begin();
 
   /* Listen for PPP status events */
-  if (_ppp_ev_instance == NULL && esp_event_handler_instance_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, &_ppp_event_cb, NULL, &_ppp_ev_instance)) {
+  if (_ppp_ev_instance == NULL &&
+      esp_event_handler_instance_register(
+        NETIF_PPP_STATUS, ESP_EVENT_ANY_ID,
+        [](void* self, esp_event_base_t base, int32_t id, void* data) { static_cast<PPPClass*>(self)->_onPppEvent(id, data); },
+        this, &_ppp_ev_instance))
+  {
     log_e("event_handler_instance_register for NETIF_PPP_STATUS Failed!");
     return false;
   }
@@ -360,12 +346,11 @@ bool PPPClass::begin(ppp_modem_model_t model, uint8_t uart_num, int baud_rate) {
     }
   }
 
-  Network.onSysEvent(onPppArduinoEvent);
+  _arduino_ppp_ev_instance = Network.onSysEvent([this](arduino_event_id_t event, const arduino_event_info_t *info){_onPppArduinoEvent(event, info);});
 
   setStatusBits(ESP_NETIF_STARTED_BIT);
   arduino_event_t arduino_event;
-  arduino_event.event_id = ARDUINO_EVENT_PPP_START;
-  Network.postEvent(&arduino_event);
+  Network.postEvent(ARDUINO_EVENT_PPP_START);
 
   return true;
 
@@ -375,34 +360,30 @@ err:
 }
 
 void PPPClass::end(void) {
-  if (_esp_modem && _esp_netif && _dce) {
+  if (_esp_netif && _dce) {
 
     if ((getStatusBits() & ESP_NETIF_CONNECTED_BIT) != 0) {
       clearStatusBits(ESP_NETIF_CONNECTED_BIT | ESP_NETIF_HAS_IP_BIT | ESP_NETIF_HAS_LOCAL_IP6_BIT | ESP_NETIF_HAS_GLOBAL_IP6_BIT);
-      arduino_event_t disconnect_event;
-      disconnect_event.event_id = ARDUINO_EVENT_PPP_DISCONNECTED;
-      Network.postEvent(&disconnect_event);
+      Network.postEvent(ARDUINO_EVENT_PPP_DISCONNECTED);
     }
 
     clearStatusBits(
       ESP_NETIF_STARTED_BIT | ESP_NETIF_CONNECTED_BIT | ESP_NETIF_HAS_IP_BIT | ESP_NETIF_HAS_LOCAL_IP6_BIT | ESP_NETIF_HAS_GLOBAL_IP6_BIT
       | ESP_NETIF_HAS_STATIC_IP_BIT
     );
-    arduino_event_t arduino_event;
-    arduino_event.event_id = ARDUINO_EVENT_PPP_STOP;
-    Network.postEvent(&arduino_event);
+    Network.postEvent(ARDUINO_EVENT_PPP_STOP);
   }
 
   destroyNetif();
 
   if (_ppp_ev_instance != NULL) {
-    if (esp_event_handler_unregister(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, &_ppp_event_cb) == ESP_OK) {
+    if (esp_event_handler_instance_unregister(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, _ppp_ev_instance) == ESP_OK) {
       _ppp_ev_instance = NULL;
     }
   }
-  _esp_modem = NULL;
 
-  Network.removeEvent(onPppArduinoEvent);
+  Network.removeEvent(_arduino_ppp_ev_instance);
+  _arduino_ppp_ev_instance = 0;
 
   if (_dce != NULL) {
     esp_modem_destroy(_dce);

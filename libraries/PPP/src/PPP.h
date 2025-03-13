@@ -88,10 +88,6 @@ public:
 protected:
   size_t printDriverInfo(Print &out) const;
 
-public:
-  void _onPppEvent(int32_t event_id, void *event_data);
-  void _onPppArduinoEvent(arduino_event_id_t event, arduino_event_info_t info);
-
 private:
   esp_modem_dce_t *_dce;
   int8_t _pin_tx;
@@ -108,6 +104,12 @@ private:
   int _tx_buffer_size;
   esp_modem_dce_mode_t _mode;
   uint8_t _uart_num;
+
+  esp_event_handler_instance_t _ppp_ev_instance{NULL};
+  network_event_handle_t       _arduino_ppp_ev_instance{0};
+  
+  void _onPppEvent(int32_t event_id, void *event_data);
+  void _onPppArduinoEvent(arduino_event_id_t event, const arduino_event_info_t *info);
 
   static bool pppDetachBus(void *bus_pointer);
 };
